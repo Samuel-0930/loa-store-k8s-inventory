@@ -1,16 +1,16 @@
-
 import pandas as pd
 import numpy as np
 from datetime import datetime
 from sklearn.metrics import mean_absolute_error, mean_squared_error, mean_absolute_percentage_error
 from sklearn.model_selection import RandomizedSearchCV, TimeSeriesSplit
+from sklearn.linear_model import LinearRegression, Ridge, Lasso, RidgeCV
 from sklearn.ensemble import RandomForestRegressor, StackingRegressor
-from sklearn.linear_model import RidgeCV, LassoCV
+from sklearn.tree import DecisionTreeRegressor
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
 from statsmodels.tsa.arima.model import ARIMA
 import warnings
 
-# 고급 모델 로드 (설치 필요: pip install xgboost lightgbm prophet)
+# 고급 모델 로드
 try:
     from xgboost import XGBRegressor
     from lightgbm import LGBMRegressor
@@ -39,7 +39,6 @@ def advanced_feature_engineering(df):
         
     # 3. Rolling Window (Window Statistics)
     for window in [7, 30]:
-        # shift(1)을 통해 현재 시점의 정답이 윈도우 계산에 포함되지 않도록 함 (Leakage 방지)
         df[f'rolling_mean_{window}'] = df.groupby('item_id')['quantity'].shift(1).transform(lambda x: x.rolling(window=window).mean())
         df[f'rolling_std_{window}'] = df.groupby('item_id')['quantity'].shift(1).transform(lambda x: x.rolling(window=window).std())
         
@@ -63,16 +62,21 @@ def run_experiment(csv_path):
     df_raw = pd.read_csv(csv_path)
     df = advanced_feature_engineering(df_raw)
     
-    # 분석 대상 아이템 선정
+    # 분석 대상 아이템 선정 (1번 상품)
     data = df[df['item_id'] == 1].sort_values('date')
     train, val, test = train_val_test_split(data)
     
+    # ML 모델용 데이터 분할
     X_train = train.drop(['date', 'quantity', 'item_id'], axis=1)
     y_train = train['quantity']
     X_val = val.drop(['date', 'quantity', 'item_id'], axis=1)
     y_val = val['quantity']
     X_test = test.drop(['date', 'quantity', 'item_id'], axis=1)
     y_test = test['quantity']
+    
+    # 결합 데이터 (학습 + 검증) - HPO 및 최종 학습용
+    X_train_val = pd.concat([X_train, X_val])
+    y_train_val = pd.concat([y_train, y_val])
     
     results = []
 
@@ -82,7 +86,70 @@ def run_experiment(csv_path):
         mape = mean_absolute_percentage_error(y_true, y_pred)
         return {"Model": model_name, "MAE": mae, "RMSE": rmse, "MAPE": mape}
 
-    # --- 1. Prophet (E-commerce 표준) ---
+    # --- 1. Baseline Models ---
+    # Naive (마지막 값 유지)
+    pred_naive = np.full(len(y_test), y_train_val.iloc[-1])
+    results.append(evaluate_predictions(y_test, pred_naive, "Naive (Baseline)"))
+
+    # SMA (7d 이동 평균)
+    pred_sma = np.full(len(y_test), y_train_val.tail(7).mean())
+    results.append(evaluate_predictions(y_test, pred_sma, "SMA (7d)"))
+
+    # --- 2. Statistical Models ---
+    # ETS (Exponential Smoothing)
+    try:
+        model_ets = ExponentialSmoothing(y_train_val, seasonal_periods=7, trend='add', seasonal='add').fit()
+        pred_ets = model_ets.forecast(len(y_test))
+        results.append(evaluate_predictions(y_test, pred_ets, "ETS"))
+    except Exception as e:
+        print(f"ETS Error: {e}")
+
+    # ARIMA
+    try:
+        model_arima = ARIMA(y_train_val, order=(5, 1, 0)).fit()
+        pred_arima = model_arima.forecast(len(y_test))
+        results.append(evaluate_predictions(y_test, pred_arima, "ARIMA"))
+    except Exception as e:
+        print(f"ARIMA Error: {e}")
+
+    # --- 3. Classical ML Models ---
+    ml_models = {
+        "Linear Regression": LinearRegression(),
+        "Ridge": Ridge(),
+        "Lasso": Lasso(),
+        "Decision Tree": DecisionTreeRegressor(random_state=42),
+        "Random Forest (Default)": RandomForestRegressor(n_estimators=100, random_state=42)
+    }
+
+    for name, model in ml_models.items():
+        try:
+            model.fit(X_train_val, y_train_val)
+            pred = model.predict(X_test)
+            results.append(evaluate_predictions(y_test, pred, name))
+        except Exception as e:
+            print(f"{name} Error: {e}")
+
+    # --- 4. Advanced Boosting Models ---
+    # XGBoost
+    try:
+        model_xgb = XGBRegressor(n_estimators=100, learning_rate=0.05, random_state=42)
+        model_xgb.fit(X_train_val, y_train_val)
+        pred_xgb = model_xgb.predict(X_test)
+        results.append(evaluate_predictions(y_test, pred_xgb, "XGBoost"))
+    except Exception as e:
+        print(f"XGBoost Error: {e}")
+
+    # LightGBM
+    try:
+        model_lgbm = LGBMRegressor(n_estimators=100, learning_rate=0.05, random_state=42, verbose=-1)
+        model_lgbm.fit(X_train_val, y_train_val)
+        pred_lgbm = model_lgbm.predict(X_test)
+        results.append(evaluate_predictions(y_test, pred_lgbm, "LightGBM"))
+    except Exception as e:
+        print(f"LightGBM Error: {e}")
+
+    # --- 5. HPO & Ensemble Models ---
+    # Prophet (E-commerce 표준)
     try:
         prophet_df = train[['date', 'quantity']].rename(columns={'date': 'ds', 'quantity': 'y'})
         m = Prophet(yearly_seasonality=False, weekly_seasonality=True, daily_seasonality=False)
@@ -93,42 +160,43 @@ def run_experiment(csv_path):
         results.append(evaluate_predictions(y_test, pred_prophet, "Prophet"))
     except Exception as e:
         print(f"Prophet Error: {e}")
-        pass
 
-    # --- 2. Random Forest w/ Hyperparameter Tuning (RandomSearch) ---
-    rf = RandomForestRegressor(random_state=42)
-    param_dist = {'n_estimators': [50, 100, 200], 'max_depth': [None, 10, 20], 'min_samples_split': [2, 5]}
-    # TimeSeriesSplit을 사용하여 시계열 교차 검증
-    tscv = TimeSeriesSplit(n_splits=3)
-    rs_rf = RandomizedSearchCV(rf, param_dist, n_iter=5, cv=tscv, scoring='neg_mean_absolute_error')
-    rs_rf.fit(pd.concat([X_train, X_val]), pd.concat([y_train, y_val]))
-    best_rf = rs_rf.best_estimator_
-    pred_rf = best_rf.predict(X_test)
-    results.append(evaluate_predictions(y_test, pred_rf, "RF (Optimized)"))
-
-    # --- 3. Stacking Ensemble (현업 끝판왕) ---
-    # 여러 우수한 모델의 예측치를 다시 학습 모델의 입력으로 사용
-    estimators = [
-        ('rf', best_rf),
-        ('ridge', RidgeCV())
-    ]
+    # Random Forest w/ Hyperparameter Tuning (RandomSearch)
     try:
-        estimators.append(('xgb', XGBRegressor(n_estimators=100)))
-    except:
-        pass
-        
-    stack_reg = StackingRegressor(estimators=estimators, final_estimator=RandomForestRegressor(n_estimators=50))
-    stack_reg.fit(pd.concat([X_train, X_val]), pd.concat([y_train, y_val]))
-    pred_stack = stack_reg.predict(X_test)
-    results.append(evaluate_predictions(y_test, pred_stack, "Stacking Ensemble"))
+        rf = RandomForestRegressor(random_state=42)
+        param_dist = {'n_estimators': [50, 100, 200], 'max_depth': [None, 10, 20], 'min_samples_split': [2, 5]}
+        tscv = TimeSeriesSplit(n_splits=3)
+        rs_rf = RandomizedSearchCV(rf, param_dist, n_iter=5, cv=tscv, scoring='neg_mean_absolute_error', random_state=42)
+        rs_rf.fit(X_train_val, y_train_val)
+        best_rf = rs_rf.best_estimator_
+        pred_rf = best_rf.predict(X_test)
+        results.append(evaluate_predictions(y_test, pred_rf, "RF (Optimized)"))
+    except Exception as e:
+        print(f"RF (Optimized) Error: {e}")
+        best_rf = RandomForestRegressor(n_estimators=100, random_state=42).fit(X_train_val, y_train_val)
 
-    # ... 추가 10개 모델 생략 및 결과 반환 로직 ...
+    # Stacking Ensemble
+    try:
+        estimators = [
+            ('rf', best_rf),
+            ('ridge', RidgeCV())
+        ]
+        try:
+            estimators.append(('xgb', XGBRegressor(n_estimators=100, random_state=42)))
+        except:
+            pass
+            
+        stack_reg = StackingRegressor(estimators=estimators, final_estimator=RandomForestRegressor(n_estimators=50, random_state=42))
+        stack_reg.fit(X_train_val, y_train_val)
+        pred_stack = stack_reg.predict(X_test)
+        results.append(evaluate_predictions(y_test, pred_stack, "Stacking Ensemble"))
+    except Exception as e:
+        print(f"Stacking Ensemble Error: {e}")
+
     return pd.DataFrame(results)
-
 
 if __name__ == "__main__":
     import os
-    # 데이터 경로 설정 (Docker 환경 및 로컬 환경 대응)
     csv_path = "data/historical_sales.csv"
     if not os.path.exists(csv_path):
         csv_path = "/app/data/historical_sales.csv"
@@ -138,9 +206,10 @@ if __name__ == "__main__":
     try:
         results_df = run_experiment(csv_path)
         
-        # 12개 모델 중 상위 결과 출력
+        # 전체 모델 결과 출력 (MAE 순 정렬)
+        results_df = results_df.sort_values("MAE")
         print("\n--- [실험 결과 요약] ---")
-        print(results_df.sort_values("MAE"))
+        print(results_df.to_string(index=False))
         
         # 결과 저장
         output_path = "research/benchmark_results.csv"
