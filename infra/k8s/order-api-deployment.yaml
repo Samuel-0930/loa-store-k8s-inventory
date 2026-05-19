@@ -5,7 +5,7 @@ metadata:
   labels:
     app: order-api
 spec:
-  # 트래픽 분산을 위해 2개의 복제본(Replica) 운영
+  # 가용성을 위해 서버 2개를 동시에 실행합니다.
   replicas: 2
   selector:
     matchLabels:
@@ -18,19 +18,19 @@ spec:
       containers:
       - name: order-api
         image: loa-store/order-api:latest
-        imagePullPolicy: Never # 로컬(Kind) 이미지를 사용하도록 설정
+        imagePullPolicy: Never # 로컬에서 빌드한 이미지를 사용하도록 설정
         ports:
         - containerPort: 8000
         env:
         - name: REDIS_HOST
-          value: "redis-service" # Redis 서비스 이름으로 내부 통신
+          value: "redis-service" # Redis 서비스와 이름으로 통신합니다.
 ---
 apiVersion: v1
 kind: Service
 metadata:
   name: order-api-service
 spec:
-  # 외부 혹은 클러스터 내부에서 접근하기 위한 서비스 설정
+  # 클러스터 내부에서 API 서버에 접근하기 위한 설정
   selector:
     app: order-api
   ports:

@@ -3,16 +3,15 @@ import json
 import time
 import os
 
-# 인프라 설정 로드
+# 환경 변수에서 Redis 접속 정보를 읽어옵니다.
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = 6379
 
 def process_inventory():
     """
-    Redis Queue에서 주문 이벤트를 가져와 실시간으로 재고를 처리하는 워커입니다.
-    데이터 분석 모듈과의 연동을 통해 재고 예측 및 발주 로직을 실행합니다.
+    Redis 큐에서 주문 이벤트를 실시간으로 가져와 처리하는 워커 프로세스입니다.
     """
-    print(f"[*] Inventory Worker 시작됨 (Redis: {REDIS_HOST})")
+    print(f"[*] 재고 관리 워커가 시작되었습니다. (접속 Redis: {REDIS_HOST})")
     
     try:
         r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=0, decode_responses=True)
@@ -21,18 +20,19 @@ def process_inventory():
         return
 
     while True:
-        # Redis List에서 오른쪽 끝의 데이터를 가져옴 (Blocking Pop)
-        # 데이터가 들어올 때까지 대기하여 CPU 리소스 낭비를 방지합니다.
-        _, message = r.brpop("order_events")
+        # Redis 리스트에서 오른쪽 끝 데이터를 가져올 때까지 대기 (BRPOP)
+        # 데이터가 없을 때는 대기 상태를 유지하여 CPU 자원을 절약합니다.
+        result = r.brpop("order_events")
         
-        if message:
+        if result:
+            _, message = result
             order = json.loads(message)
-            print(f"[+] 주문 처리 중: Item {order['item_id']}, Qty {order['quantity']} (User: {order['user_id']})")
+            print(f"[+] 주문 처리 중: 상품 ID {order['item_id']}, 수량 {order['quantity']} (사용자: {order['user_id']})")
             
-            # TODO: PostgreSQL DB 연동 및 실제 재고 차감 로직 추가 예정
-            # TODO: 재고가 임계치 이하일 경우 AI Forecasting 모듈 호출 로직 추가 예정
+            # TODO: PostgreSQL 데이터베이스에 접속하여 실제 재고 수량 차감 로직 구현 예정
+            # TODO: AI 분석 모듈을 호출하여 재고 부족 여부 판단 로직 추가 예정
             
-            time.sleep(1)  # 처리 부하 시뮬레이션
+            time.sleep(1)  # 주문 처리 과정을 시뮬레이션하기 위한 짧은 지연
 
 if __name__ == "__main__":
     process_inventory()
