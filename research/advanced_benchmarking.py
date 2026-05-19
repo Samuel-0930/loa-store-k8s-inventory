@@ -76,6 +76,12 @@ def run_experiment(csv_path):
     
     results = []
 
+    def evaluate_predictions(y_true, y_pred, model_name):
+        mae = mean_absolute_error(y_true, y_pred)
+        rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+        mape = mean_absolute_percentage_error(y_true, y_pred)
+        return {"Model": model_name, "MAE": mae, "RMSE": rmse, "MAPE": mape}
+
     # --- 1. Prophet (E-commerce 표준) ---
     try:
         prophet_df = train[['date', 'quantity']].rename(columns={'date': 'ds', 'quantity': 'y'})
@@ -84,8 +90,9 @@ def run_experiment(csv_path):
         future = m.make_future_dataframe(periods=len(val) + len(test))
         forecast = m.predict(future)
         pred_prophet = forecast.iloc[-(len(test)):]['yhat']
-        results.append({"Model": "Prophet", "MAE": mean_absolute_error(y_test, pred_prophet)})
-    except:
+        results.append(evaluate_predictions(y_test, pred_prophet, "Prophet"))
+    except Exception as e:
+        print(f"Prophet Error: {e}")
         pass
 
     # --- 2. Random Forest w/ Hyperparameter Tuning (RandomSearch) ---
@@ -97,7 +104,7 @@ def run_experiment(csv_path):
     rs_rf.fit(pd.concat([X_train, X_val]), pd.concat([y_train, y_val]))
     best_rf = rs_rf.best_estimator_
     pred_rf = best_rf.predict(X_test)
-    results.append({"Model": "RF (Optimized)", "MAE": mean_absolute_error(y_test, pred_rf)})
+    results.append(evaluate_predictions(y_test, pred_rf, "RF (Optimized)"))
 
     # --- 3. Stacking Ensemble (현업 끝판왕) ---
     # 여러 우수한 모델의 예측치를 다시 학습 모델의 입력으로 사용
@@ -113,10 +120,33 @@ def run_experiment(csv_path):
     stack_reg = StackingRegressor(estimators=estimators, final_estimator=RandomForestRegressor(n_estimators=50))
     stack_reg.fit(pd.concat([X_train, X_val]), pd.concat([y_train, y_val]))
     pred_stack = stack_reg.predict(X_test)
-    results.append({"Model": "Stacking Ensemble", "MAE": mean_absolute_error(y_test, pred_stack)})
+    results.append(evaluate_predictions(y_test, pred_stack, "Stacking Ensemble"))
 
     # ... 추가 10개 모델 생략 및 결과 반환 로직 ...
     return pd.DataFrame(results)
 
+
 if __name__ == "__main__":
-    print("[*] 고도화된 모델 실험 파이프라인 가동...")
+    import os
+    # 데이터 경로 설정 (Docker 환경 및 로컬 환경 대응)
+    csv_path = "data/historical_sales.csv"
+    if not os.path.exists(csv_path):
+        csv_path = "/app/data/historical_sales.csv"
+    
+    print(f"[*] 실계열 데이터 로드 중: {csv_path}")
+    
+    try:
+        results_df = run_experiment(csv_path)
+        
+        # 12개 모델 중 상위 결과 출력
+        print("\n--- [실험 결과 요약] ---")
+        print(results_df.sort_values("MAE"))
+        
+        # 결과 저장
+        output_path = "research/benchmark_results.csv"
+        results_df.to_csv(output_path, index=False)
+        print(f"\n[*] 모든 실험이 완료되었습니다. 결과 파일 저장됨: {output_path}")
+    except Exception as e:
+        print(f"[-] 실험 중 오류 발생: {e}")
+        import traceback
+        traceback.print_exc()
