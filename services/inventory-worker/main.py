@@ -74,7 +74,7 @@ def process_order_event(db, order_data):
         db.commit()
         print(f"[+] 재고 차감 완료 및 DB 트랜잭션 정상 커밋 (남은 재고: {stock_record.quantity}개)")
 
-        # 5. AI API 비동기 연동 및 실시간 모니터링 경고 로직
+        # 5. AI API 비동기 연동 및 실시간 모니터링 경고 로직 (DB 트랜잭션 종료 후 실행하여 락 경합 방지)
         forecast_res = call_ai_forecaster(item_id, stock_record.quantity)
         if forecast_res and "days_until_stockout" in forecast_res:
             days_left = forecast_res["days_until_stockout"]
@@ -103,13 +103,33 @@ def process_order_event(db, order_data):
         try:
             # 트랜잭션 오류 시 상태 FAILED 전환
             fail_session = SessionLocal()
-            stmt_order = fail_session.query(Order).filter(Order.id == new_order.id).first()
-            if stmt_order:
-                stmt_order.status = "FAILED"
-                fail_session.commit()
-            fail_session.close()
+            try:
+                stmt_order = fail_session.query(Order).filter(Order.id == new_order.id).first()
+                if stmt_order:
+                    stmt_order.status = "FAILED"
+                    fail_session.commit()
+            finally:
+                fail_session.close()
         except Exception as rollback_err:
             print(f"[-] 예외 주문 처리 상태 변경 실패: {rollback_err}")
+
+def recover_processing_queue(r):
+    """
+    [Reliable Queue Pattern]
+    시작 시 비정상 종료 등으로 'order_processing' 임시 대기열에 박혀있던 메시지들을
+    안전하게 원본 'order_events' 메인 큐로 재인입시켜 유실을 방지합니다 (At-least-once 보장).
+    """
+    recovered_count = 0
+    while True:
+        # order_processing 우측 끝에서 꺼내 order_events 좌측 끝으로 다시 주입
+        msg = r.rpoplpush("order_processing", "order_events")
+        if not msg:
+            break
+        recovered_count += 1
+        print(f"[⚠️ 복구] 처리 중단되었던 주문 데이터 원본 대기열로 복구 완료: {msg}")
+    
+    if recovered_count > 0:
+        print(f"[✨ 복구 완료] 총 {recovered_count}개의 메시지가 안전하게 메인 대기열로 환류되었습니다.")
 
 def main():
     print(f"[*] 재고 관리 워커 프로세스가 기동되었습니다. (접속 Redis: {REDIS_HOST})")
@@ -117,9 +137,11 @@ def main():
     # DB 연결 확인 및 헬스 체크
     try:
         db_test = SessionLocal()
-        db_test.execute("SELECT 1")
-        db_test.close()
-        print("[+] PostgreSQL 데이터베이스 연결 테스트 성공")
+        try:
+            db_test.execute("SELECT 1")
+            print("[+] PostgreSQL 데이터베이스 연결 테스트 성공")
+        finally:
+            db_test.close()
     except Exception as e:
         print(f"[-] PostgreSQL 데이터베이스 접속 불가: {e}")
         time.sleep(5)
@@ -128,20 +150,32 @@ def main():
     # Redis 연결 설정
     try:
         r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=0, decode_responses=True)
+        # 시작 전 유실 방지 복구 핸들러 작동
+        recover_processing_queue(r)
     except Exception as e:
         print(f"[-] Redis 연결 불가: {e}")
         return
 
     while True:
         try:
-            result = r.brpop("order_events", timeout=5)
-            if result:
-                _, message = result
+            # [Reliable Queue Pattern]
+            # BRPOP 대신 'brpoplpush'를 사용하여 꺼내는 동시에 원자적으로 임시 큐('order_processing')에 보관.
+            # 이로써 데이터 처리 직전 크래시가 나더라도 메시지가 유실되지 않고 안전하게 보존됩니다.
+            message = r.brpoplpush("order_events", "order_processing", timeout=5)
+            
+            if message:
                 order_data = json.loads(message)
                 
+                # [Connection Lifecycle Management]
+                # try-finally를 통해 어떤 심각한 예외상황이 일어나더라도 커넥션이 무조건 누수 없이 닫히도록 완벽히 보장합니다.
                 db = SessionLocal()
-                process_order_event(db, order_data)
-                db.close()
+                try:
+                    process_order_event(db, order_data)
+                    # 비즈니스 로직(DB 커밋 등)이 완전 성공 완료된 후 비로소 임시 큐에서 삭제(ACK 처리)
+                    r.lrem("order_processing", 1, message)
+                finally:
+                    db.close()
+                    
         except Exception as queue_err:
             print(f"[-] 큐 메시지 핸들링 오류: {queue_err}")
             time.sleep(1)
