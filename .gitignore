@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+ENV/
+env/
+.env
+.DS_Store
+test_forecaster.py
