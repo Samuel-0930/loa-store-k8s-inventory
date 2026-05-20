@@ -21,3 +21,7 @@ spec:
         env:
         - name: REDIS_HOST
           value: "redis-service"
+        - name: DATABASE_URL
+          value: "postgresql://admin:roastore123@postgres:5432/roastore"
+        - name: FORECAST_API_URL
+          value: "http://forecasting-module-service/predict"
