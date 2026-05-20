@@ -1,0 +1,38 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: forecasting-module
+  labels:
+    app: forecasting-module
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: forecasting-module
+  template:
+    metadata:
+      labels:
+        app: forecasting-module
+    spec:
+      containers:
+      - name: forecasting-module
+        image: loa-store/forecasting-module:latest
+        imagePullPolicy: Never
+        ports:
+        - containerPort: 8000
+        env:
+        - name: DATA_PATH
+          value: "/app/data/historical_sales.csv"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: forecasting-module-service
+spec:
+  selector:
+    app: forecasting-module
+  ports:
+  - protocol: TCP
+    port: 80
+    targetPort: 8000
+  type: ClusterIP
